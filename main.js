@@ -14,20 +14,20 @@ function checkLocalToken() {
     if (!storageItem) {
         getAccessToken();
         console.log("Access token not found, requesting new token");
+        return;
     }
     storageItem = JSON.parse(storageItem);
 
     let storageExpDate = storageItem.expiry + 10800000; //account for the time difference of 3 hours between client and server
     if (new Date().getTime() > storageExpDate - 60000) { //checks if the token is about to expire in 1 minute
         getAccessToken();
-        console.log("Access token expired, requesting new token");
+        console.log("Access token expired/about to expire, requesting new token");
+    } else {
+        // if local token is found and is not about to expire, use it.
+        accessTokenGlobal = storageItem.value;
+        console.log("Access token found in local storage: ", accessTokenGlobal, ". It will expire on ", storageExpDate);
+        document.getElementById("accessTokenStatusMsg").innerText = "Access token acquired from local storage.";
     }
-
-    //TO DO: if new token requested, do not load token from localStorage
-
-    accessTokenGlobal = storageItem.value;
-    console.log("Access token found in local storage: ", accessTokenGlobal, ". It will expire on ", storageExpDate);
-    document.getElementById("accessTokenStatusMsg").innerText = "Access token acquired from local storage.";
 }
 
 //saves the access token and its expiry date to local storage
@@ -36,7 +36,6 @@ function setTokenWithExpiry(accessToken, expiryDate) {
         value: accessToken,
         expiry: new Date(expiryDate).getTime()
     }
-    console.log(item.expiry);
     localStorage.setItem("accessToken", JSON.stringify(item));
 }
 
@@ -44,7 +43,7 @@ async function getAccessToken() {
 
     let req = new XMLHttpRequest();
     req.open("GET", "http://10.101.0.1:10101/?token=renew", true);
-    req.setRequestHeader("Authorization", "Basic "); //token removed for security reasons
+    req.setRequestHeader("Authorization", `Basic `); //encoded username:password removed for security reasons
     req.send();
 
     req.onreadystatechange = function () {
@@ -55,21 +54,25 @@ async function getAccessToken() {
             console.log(xmlDoc);
             let accessToken = xmlDoc.getElementsByTagName("Value")[0].childNodes[0].nodeValue;
             let accessTokenExpDate = xmlDoc.getElementsByTagName("Expires")[0].childNodes[0].nodeValue;
-            //update global value
-            accessTokenGlobal = accessToken
 
+            accessTokenGlobal = accessToken;
 
             setTokenWithExpiry(accessToken, accessTokenExpDate);
-            document.getElementById("accessTokenStatusMsg").innerText = "Access token acquired";
+            document.getElementById("accessTokenStatusMsg").innerText = "Access token acquired from server";
             console.log("Access token: ", accessToken);
             console.log("Expires: ", accessTokenExpDate);
         } else {
-            document.getElementById("accessTokenStatusMsg").innerText = "Failed to acquire access token";
+            document.getElementById("accessTokenStatusMsg").innerText = "Failed to acquire access token. Check console logs for info.";
         }
     }
 }
 
 async function startDataCollection() {
+
+    document.querySelector("#downloadButton")?.remove();
+    readings = []; //reset readings to empty every time a new data collection process starts
+
+    checkLocalToken(); //check if local access token is still valid/will expire soon
 
     const response = await fetch("http://10.101.0.1:10101/task", {
         method: "POST",
@@ -81,14 +84,22 @@ async function startDataCollection() {
     });
 
     if (response.ok) {
-        console.log("Server responded with 200 OK");
-        getReading()
+        console.log("Server responded with 200 OK. Data collection started.");
+
+        //create loading spinner
+        const loader = document.createElement('div');
+        loader.className = 'loader';
+        document.querySelector('#dataCollection').appendChild(loader);
+
+        getReadings()
     } else {
         console.log("Failed to start data collection:", response);
     }
 }
 
 async function stopDataCollection() {
+
+    checkLocalToken(); //check if local access token is still valid/will expire soon
 
     const response = await fetch("http://10.101.0.1:10101/task", {
         method: "POST",
@@ -106,7 +117,8 @@ async function stopDataCollection() {
     }
 }
 
-async function getReading() {
+async function getReadings() {
+    checkLocalToken()
 
     while (readings.length < 100) {
         try {
@@ -125,7 +137,6 @@ async function getReading() {
             var machineData = await response.json();
             var data = machineData.data;
 
-
             console.log(data);
             if (data.type == 'unknown' || data.temp < 3 || data.temp >= 200) {
                 continue;
@@ -138,57 +149,95 @@ async function getReading() {
     }
 
     stopDataCollection();
-    console.log(readings.length);
-    console.log(readings);
     exportData();
-
 }
 
 function exportData() {
-
-    let csv = 'Time,Node,Type,Temperature °C,Δ\n';
+    let csv = 'Time,Node,Type,Temperature\u00B0C,\u0394\n';
     let delta, celsius;
-
 
     for (let i = 0; i < readings.length; i++) {
         let reading = readings[i];
         let matchFound = false;
-        celsius = ((reading.temp - 32) * 5 / 9).toFixed(2);
 
-        //find delta
+        // convert farenheit to celsius
+        celsius = Math.round(((reading.temp - 32) * 5 / 9) * 100) / 100;
 
-        let index = readings.indexOf(reading); //index of currently observed reading
+        if (reading.type === "unknown") {
+            continue;
+        }
 
-        if (index === 0) {
+        if (i === 0) { // skip delta for first reading, just add it to csv
             delta = '';
             csv += `${reading.time},${reading.node},${reading.type},${celsius},${delta}\n`;
             continue;
-        } //skip first reading
+        }
 
-        while (index > 0 && !matchFound) {
-            let prevReading = readings[index - 1];
+        // find the delta for readings with the same node and type
+        for (let j = i - 1; j >= 0; j--) {
+            let prevReading = readings[j];
             if (reading.node == prevReading.node && reading.type == prevReading.type) {
-                delta = (reading.temp - prevReading.temp).toFixed(2);
-                csv += `${reading.time},${reading.node},${reading.type},${celsius},${delta}\n`;
+                prevReadingCelsius = Math.round(((prevReading.temp - 32) * 5 / 9) * 100) / 100;
+                delta = Math.round((celsius - prevReadingCelsius) * 100) / 100;
                 matchFound = true;
+                break;
             } else {
-                index--;
+                delta = '';
             }
         }
-
-        if (!matchFound) {
-            delta = '';
-            csv += `${reading.time},${reading.node},${reading.type},${celsius},${delta}\n`;
-        }
+        csv += `${reading.time},${reading.node},${reading.type},${celsius},${delta}\n`;
     }
-    console.log(csv);
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8,' })
-    const objUrl = URL.createObjectURL(blob)
-    const link = document.createElement('a')
-    link.setAttribute('href', objUrl)
-    link.setAttribute('download', 'File.csv')
-    link.textContent = 'Download CSV'
-    document.querySelector('body').append(link)
 
 
+    //create CSV file and download button
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8,' });
+    const objUrl = URL.createObjectURL(blob);
+
+    let filename;
+    fetchFileName().then((name) => {
+        filename = name;
+    })
+
+    document.querySelector(".loader").remove();
+
+    const button = document.createElement('button');
+    button.textContent = 'Download CSV';
+    button.id = 'downloadButton';
+    button.addEventListener('click', () => {
+        const link = document.createElement('a');
+        link.setAttribute('href', objUrl);
+        link.setAttribute('download', filename);
+        link.click();
+    });
+    document.querySelector("#dataCollection").appendChild(button);
+
+}
+
+async function fetchFileName() {
+    checkLocalToken()
+
+    try {
+        const response = await fetch('http://10.101.0.1:10101/csv', {
+            method: 'GET',
+            headers: {
+                'Authorization': `Bearer ${accessTokenGlobal}`
+            }
+        });
+
+        const filesize = response.headers.get('Content-Length');
+        console.log("Server csv filesize: " + filesize / 1000 + " Kb")
+
+        const contentDisposition = response.headers.get('Content-Disposition');
+        if (contentDisposition) {
+            const matches = contentDisposition.match(/filename="(.+?)"/);
+            if (matches && matches.length > 1) {
+                console.log(matches[1]);
+                return matches[1];
+            }
+        }
+        return 'file.csv'; // Default filename if no match
+    } catch (error) {
+        console.error('Error fetching the filename:', error);
+        return 'file.csv'; // Default filename in case of an error
+    }
 }
